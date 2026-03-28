@@ -4,3 +4,11 @@ venv/
 *.vts
 *.imu
 *.mp4
+__pycache__/
+debug.txt
+debug2.txt
+debug3.txt
+hand_landmarker.task
+output.csv
+output.jsonl
+pose_landmarker_lite.task

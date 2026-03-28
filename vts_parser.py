@@ -89,23 +89,45 @@ class VTSParser:
 
         raw_bytes = self.path.read_bytes()
 
-        # 1. VTK XML StructuredGrid
+        # 1. TRI binary signature (e.g. TRIVTS01)
+        if raw_bytes.startswith(b"TRIVTS"):
+            return self._parse_tri_vts(raw_bytes)
+
+        # 2. VTK XML StructuredGrid
         result = self._try_vtk_xml(raw_bytes)
         if result: return result
 
-        # 2. Float64 rows (try widths 10, 8, 7, 4, 1)
+        # 3. Flat float-rows probe
+        # Try Float64 rows
         result = self._try_float_rows(raw_bytes, np.float64)
         if result: return result
 
-        # 3. Float32 rows
+        # Try Float32 rows
         result = self._try_float_rows(raw_bytes, np.float32)
         if result: return result
 
-        # 4. Unknown binary — store raw bytes metadata
+        # 4. Unknown binary
         return VTSData(
             format="unknown_binary",
             timestamps=np.array([]),
             meta={"size_bytes": len(raw_bytes)},
+        )
+
+    def _parse_tri_vts(self, raw: bytes) -> VTSData:
+        """Parse TRIVTS01: 32-byte header, then uint64 nanoseconds."""
+        header_size = 32
+        data = raw[header_size:]
+        n = len(data) // 8
+        if n == 0:
+            return VTSData(format="tri_vts_empty", timestamps=np.array([]))
+            
+        ts_ns = np.frombuffer(data[:n*8], dtype=np.uint64).astype(np.float64)
+        ts_sec = (ts_ns - ts_ns[0]) / 1e9
+        
+        return VTSData(
+            format="tri_vts_u64",
+            timestamps=ts_sec,
+            meta={"n": n}
         )
 
     # ── Format probes ─────────────────────────────────────────────────────────

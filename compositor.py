@@ -26,7 +26,7 @@ import math, textwrap
 import cv2
 import numpy as np
 
-from kinematics import LM_FINGER, HAND_CONN, TIPS
+from kinematics import LM_FINGER, HAND_CONN, TIPS, CUBE_H, _cs
 
 
 # ── Colour palette ────────────────────────────────────────────────────────────
@@ -59,7 +59,7 @@ FONT_B = cv2.FONT_HERSHEY_DUPLEX
 # Body landmark indices
 P_LS=11; P_RS=12; P_LE=13; P_RE=14; P_LW=15; P_RW=16
 
-_SW=0.22; _TH=0.18; _UA=0.26; _FA=0.22; _HW=0.10; CUBE_H=0.16
+_SW=0.22; _TH=0.18; _UA=0.26; _FA=0.22; _HW=0.10
 
 TPOSE = {
     "nose": np.array([0,.52,0]),
@@ -94,10 +94,6 @@ def _p3(pt, R, cx, cy, sc):
 def _zd(pt, R):
     return float((R @ np.asarray(pt, np.float64))[2])
 
-def _cs(lms, half=CUBE_H, fill=0.60):
-    c = lms - lms[0]
-    e = np.abs(c).max()
-    return c * (half*fill/e) if e > 1e-9 else c
 
 def _sv(start, end, length):
     v = end - start

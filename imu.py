@@ -205,15 +205,61 @@ class IMUStream:
 
     def _load(self):
         raw = self.path.read_bytes()
-        # Try CSV first (text)
+        # 1. Check for TRI binary signatures
+        if raw.startswith(b"TRIMU001"):
+            # TRIMU001: 52-byte header, 80-byte (20-float) records.
+            self.samples = self._parse_tri_imu(raw)
+            return
+
+        # 2. Try CSV (text)
         try:
             text = raw.decode("utf-8", errors="strict")
             self.samples = self._parse_csv(text)
             return
         except (UnicodeDecodeError, ValueError):
             pass
-        # Try binary float64 rows of 10
+        # 3. Fallback: try raw binary float64/float32 rows of 10
         self.samples = self._parse_binary(raw)
+
+    def _parse_tri_imu(self, raw: bytes) -> list[IMUSample]:
+        """Parse TRIMU001 20-float records (80 bytes each) starting at offset 52."""
+        header_size = 52
+        record_size = 80
+        data = raw[header_size:]
+        n = len(data) // record_size
+        if n == 0: return []
+        
+        # We read as both uint32 (for clock) and float32 (for data)
+        arr_f = np.frombuffer(data[:n*record_size], dtype=np.float32).reshape(n, 20)
+        arr_u = np.frombuffer(data[:n*record_size], dtype=np.uint32).reshape(n, 20)
+        
+        # Col 0: Clock (e.g. 10 MHz uint32)
+        # Col 5,6,7: acc; 8,9,10: gyro; 11,12,13: mag; 14,15,16,17: qx,qy,qz,qw
+        samples = []
+        t0 = None
+        for i in range(n):
+            # Convert clock to seconds (assume 10MHz if not sure)
+            clock = float(arr_u[i, 0])
+            if t0 is None and clock > 0: t0 = clock
+            ts = (clock - t0) / 1e7 if t0 is not None else 0.0
+            
+            s = IMUSample(
+                ts=ts,
+                ax=float(arr_f[i, 5]), ay=float(arr_f[i, 6]), az=float(arr_f[i, 7]),
+                gx=float(arr_f[i, 8]), gy=float(arr_f[i, 9]), gz=float(arr_f[i, 10]),
+                mx=float(arr_f[i, 11]), my=float(arr_f[i, 12]), mz=float(arr_f[i, 13]),
+            )
+            
+            # Pre-fused orientation (indices 14-17 are qx, qy, qz, qw)
+            q_raw = arr_f[i, 14:18]
+            norm_q = np.linalg.norm(q_raw)
+            if 0.9 < norm_q < 1.1:
+                qx, qy, qz, qw = q_raw / norm_q
+                s.quaternion = np.array([float(qw), float(qx), float(qy), float(qz)])
+                
+            samples.append(s)
+            
+        return samples
 
     def _parse_csv(self, text: str) -> list[IMUSample]:
         import csv, io
@@ -242,19 +288,45 @@ class IMUStream:
         return self._scale_and_build(rows)
 
     def _parse_binary(self, raw: bytes) -> list[IMUSample]:
-        """Try packed float64 rows of 10, then float32."""
-        n64 = len(raw) // (10 * 8)
-        n32 = len(raw) // (10 * 4)
-        if n64 > 0:
-            arr = np.frombuffer(raw[:n64 * 80], dtype=np.float64).reshape(n64, 10)
-        elif n32 > 0:
-            arr = np.frombuffer(raw[:n32 * 40], dtype=np.float32).reshape(n32, 10).astype(np.float64)
-        else:
-            raise ValueError("Cannot parse binary .imu: unexpected size")
-        return self._scale_and_build(arr.tolist())
+        """Try packed float64 rows of 10, then float32, with monotonicity check."""
+        # Heuristic to detect best format
+        best_arr = None
+        
+        for dtype in [np.float64, np.float32]:
+            item_size = 10 * np.dtype(dtype).itemsize
+            n = len(raw) // item_size
+            if n < 2: continue
+            
+            arr = np.frombuffer(raw[:n * item_size], dtype=dtype).reshape(n, 10).astype(np.float64)
+            # Check if timestamps (col 0) are monotone and plausible
+            ts = arr[:, 0]
+            if np.all(np.diff(ts[ts > 0]) >= 0) and np.any(ts > 0):
+                best_arr = arr
+                break
+        
+        if best_arr is None:
+            # Last resort: just take float32 if length permits
+            if len(raw) >= 40:
+                n = len(raw) // 40
+                best_arr = np.frombuffer(raw[:n * 40], dtype=np.float32).reshape(n, 10).astype(np.float64)
+            else:
+                raise ValueError("Cannot parse binary .imu: unexpected size or no valid data found")
+                
+        return self._scale_and_build(best_arr.tolist())
 
     def _scale_and_build(self, rows: list) -> list[IMUSample]:
         arr  = np.array(rows, dtype=np.float64)  # (N,10)
+        
+        # Remove zero rows (padding/init records)
+        if len(arr) > 0:
+            # Keep rows where at least one sensor value (index 1..9) is non-zero
+            # or the timestamp is notably non-zero.
+            mask = np.any(arr[:, 1:] != 0, axis=1) | (arr[:, 0] > 0)
+            arr = arr[mask]
+
+        if len(arr) == 0:
+            return []
+
         ts   = arr[:, 0]
         accs = arr[:, 1:4]
         gyrs = arr[:, 4:7]
@@ -313,21 +385,26 @@ class IMUStream:
         g_world = np.array([0., 0., -GRAVITY])
 
         for s in self.samples:
-            gyr = np.array([s.gx, s.gy, s.gz])
             acc = np.array([s.ax, s.ay, s.az])
+            gyr = np.array([s.gx, s.gy, s.gz])
             mag = np.array([s.mx, s.my, s.mz])
 
-            if _AHRS_OK:
-                if self.mag_enabled and np.linalg.norm(mag) > 1e-3:
-                    q = filt.updateMARG(q, gyr=gyr, acc=acc, mag=mag)
-                else:
-                    q = filt.updateIMU(q, gyr=gyr, acc=acc)
-                s.quaternion = q.copy()
+            # If we already have a pre-fused orientation from the stream, use it.
+            if s.quaternion is not None and np.linalg.norm(s.quaternion) > 0.9:
+                # Synchronize Madgwick filter state to pre-fused orientation
+                q = s.quaternion.copy()
             else:
-                if self.mag_enabled and np.linalg.norm(mag) > 1e-3:
-                    s.quaternion = filt.update(gyr, acc, mag).copy()
+                if _AHRS_OK:
+                    if self.mag_enabled and np.linalg.norm(mag) > 1e-3:
+                        q = filt.updateMARG(q, gyr=gyr, acc=acc, mag=mag)
+                    else:
+                        q = filt.updateIMU(q, gyr=gyr, acc=acc)
+                    s.quaternion = q.copy()
                 else:
-                    s.quaternion = filt._update_imu(gyr, acc).copy()
+                    if self.mag_enabled and np.linalg.norm(mag) > 1e-3:
+                        s.quaternion = filt.update(gyr, acc, mag).copy()
+                    else:
+                        s.quaternion = filt._update_imu(gyr, acc).copy()
 
             # Gravity-subtracted acceleration in world frame
             R = s.rotation_matrix()

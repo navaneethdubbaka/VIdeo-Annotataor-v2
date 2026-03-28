@@ -306,3 +306,15 @@ def pw(lm_list) -> np.ndarray:
     a = np.array([[l.x, l.y, l.z] for l in lm_list], dtype=np.float64)
     a[:, 1] *= -1
     return a
+
+
+# ── 3-D display scaling ──────────────────────────────────────────────────────
+
+CUBE_H = 0.16   # half-side of the bounding cube used for 3-D hand display
+
+
+def _cs(lms: np.ndarray, half: float = CUBE_H, fill: float = 0.60) -> np.ndarray:
+    """Centre landmarks around wrist and scale to fit a display cube."""
+    c = lms - lms[0]
+    e = np.abs(c).max()
+    return c * (half * fill / e) if e > 1e-9 else c
