@@ -1,0 +1,6 @@
+venv/
+.venv/
+*.zip
+*.vts
+*.imu
+*.mp4
