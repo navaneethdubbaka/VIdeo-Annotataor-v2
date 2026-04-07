@@ -268,84 +268,59 @@ def _draw_horizon(img, cx, cy, r, roll_deg, pitch_deg):
 def draw_info_panel(W, H, rpy_data, grasp_data, joint_data,
                     imu_accel_history: list[float] | None = None):
     """
-    rpy_data   : {label: (roll, pitch, yaw)}  — world-frame
-    grasp_data : {label: (type, aperture, contact)}
-    joint_data : {label: {joint: angle_deg}}
-    imu_accel_history : recent accel magnitudes for sparkline
+    Compact version to fit in H/2 pane.
     """
     canvas = np.full((H,W,3),(248,248,248),np.uint8)
-    PAD=6; y=10
+    PAD=6; y=12
 
-    cv2.putText(canvas,"WORLD POSE / GRASP",(PAD,y),FONT,0.28,TXT_G,1,cv2.LINE_AA)
-    y+=3; cv2.line(canvas,(PAD,y),(W-PAD,y),BORDER,1); y+=8
+    cv2.putText(canvas,"WORLD POSE / GRASP",(PAD,y),FONT,0.30,TXT_G,1,cv2.LINE_AA)
+    y+=4; cv2.line(canvas,(PAD,y),(W-PAD,y),BORDER,1); y+=10
 
+    # Draw Left and Right side-by-side if W is large enough
+    # For now, keep vertical stack but reduce padding
     for side, hcol in [("Left",L_BGR),("Right",R_BGR)]:
+        if y > H-20: break
         cv2.rectangle(canvas,(PAD,y-1),(PAD+4,y+9),hcol,-1)
-        cv2.putText(canvas,side,(PAD+8,y+8),FONT_B,0.35,hcol,1,cv2.LINE_AA)
-        y+=14
+        cv2.putText(canvas,side,(PAD+8,y+8),FONT_B,0.37,hcol,1,cv2.LINE_AA)
+        y+=13
 
         rpy = rpy_data.get(side)
         if rpy:
             r_,p_,y_ = rpy
+            # Draw RPY bars more compactly
+            bar_w = W-PAD*2
             for lbl,val in [("R",r_),("P",p_),("Y",y_)]:
-                bar_w = W-PAD*2
+                if y > H-10: break
                 filled = int(bar_w*min(abs(val)/180.,1.))
                 bar_col = AX_X if lbl=="R" else (AX_Y if lbl=="P" else AX_Z)
-                cv2.rectangle(canvas,(PAD,y+1),(PAD+bar_w,y+7),(225,225,225),-1)
-                cv2.rectangle(canvas,(PAD,y+1),(PAD+filled,y+7),bar_col,-1)
-                cv2.putText(canvas,f"{lbl} {val:+.0f}",(PAD,y+16),
+                cv2.rectangle(canvas,(PAD,y+1),(PAD+bar_w,y+6),(225,225,225),-1)
+                cv2.rectangle(canvas,(PAD,y+1),(PAD+filled,y+6),bar_col,-1)
+                cv2.putText(canvas,f"{lbl} {val:+.0f}",(PAD+2,y+15),
                             FONT,0.28,bar_col,1,cv2.LINE_AA)
-                y+=18
+                y+=17
         else:
             cv2.putText(canvas,"no data",(PAD,y+8),FONT,0.27,TXT_L,1,cv2.LINE_AA)
             y+=14
 
         if grasp_data and side in grasp_data:
             gt,ap,cs_ = grasp_data[side]
-            cv2.putText(canvas,gt,(PAD,y+9),FONT_B,0.34,TXT_D,1,cv2.LINE_AA); y+=12
+            cv2.putText(canvas,gt,(PAD,y+9),FONT_B,0.34,TXT_D,1,cv2.LINE_AA)
             cv2.putText(canvas,f"ap {ap*100:.1f}cm  {cs_}",
-                        (PAD,y+9),FONT,0.27,TXT_G,1,cv2.LINE_AA); y+=13
+                        (PAD+60,y+9),FONT,0.27,TXT_G,1,cv2.LINE_AA)
+            y+=14
 
-        if joint_data and side in joint_data:
-            fja = joint_data[side]
-            cv2.putText(canvas,"joints°",(PAD,y+8),FONT,0.25,TXT_G,1,cv2.LINE_AA); y+=11
-            fingers = [
-                ("Th",["thumb_mcp","thumb_ip"]),
-                ("Ix",["idx_mcp","idx_pip","idx_dip"]),
-                ("Md",["mid_mcp","mid_pip","mid_dip"]),
-                ("Rg",["ring_mcp","ring_pip","ring_dip"]),
-                ("Pk",["pinky_mcp","pinky_pip","pinky_dip"]),
-            ]
-            bar_full = W-PAD*2
-            for abbr,keys in fingers:
-                if y >= H-14: break
-                cv2.putText(canvas,abbr,(PAD,y+8),FONT_B,0.28,TXT_D,1,cv2.LINE_AA)
-                bx = PAD+16; slot_w = (bar_full-16)//len(keys)
-                for k in keys:
-                    ang = fja.get(k,0.)
-                    blen = int(slot_w*min(ang/180.,1.))
-                    cv2.rectangle(canvas,(bx,y+1),(bx+slot_w-2,y+6),(220,220,220),-1)
-                    cv2.rectangle(canvas,(bx,y+1),(bx+blen,y+6),hcol,-1)
-                    cv2.putText(canvas,f"{ang:.0f}",(bx,y+14),FONT,0.22,TXT_G,1,cv2.LINE_AA)
-                    bx+=slot_w
-                y+=16
+        y+=2; cv2.line(canvas,(PAD,y),(W-PAD,y),BORDER,1); y+=8
 
-        y+=4; cv2.line(canvas,(PAD,y),(W-PAD,y),BORDER,1); y+=8
-
-    # IMU accel sparkline
-    if imu_accel_history and len(imu_accel_history)>2 and y<H-20:
-        cv2.putText(canvas,"IMU |a|",(PAD,y+8),FONT,0.25,TXT_G,1,cv2.LINE_AA)
-        y+=12
-        sh = min(20, H-y-4)
+    # IMU accel sparkline (very compact)
+    if imu_accel_history and len(imu_accel_history)>2 and y<H-15:
+        sh = min(16, H-y-4)
         if sh>4:
+            pts_x = np.linspace(PAD, W-PAD, len(imu_accel_history[-W:])).astype(int)
             hist = np.array(imu_accel_history[-W:])
             mn,mx = hist.min(), hist.max()+1e-9
-            pts_x = np.linspace(PAD, W-PAD, len(hist)).astype(int)
             pts_y = (y+sh - (hist-mn)/(mx-mn)*sh).astype(int)
             for i in range(1,len(pts_x)):
-                cv2.line(canvas,(pts_x[i-1],pts_y[i-1]),(pts_x[i],pts_y[i]),
-                         AX_Z,1,cv2.LINE_AA)
-            y+=sh+4
+                cv2.line(canvas,(pts_x[i-1],pts_y[i-1]),(pts_x[i],pts_y[i]),AX_Z,1,cv2.LINE_AA)
 
     return canvas
 
@@ -453,25 +428,26 @@ def build_frame(frame, nlms, hness,
                 imu_accel_history=None,
                 step_method="equal_split") -> np.ndarray:
 
-    INFO_W = 190
-    cam_w  = int(out_w * 0.42)
-    plot_w = out_w - cam_w - INFO_W - 2
+    # 2-Column Layout: [Left (Camera)] | [Right (Hands + Metrics)]
+    cam_w  = int(out_w * 0.58)
+    plot_w = out_w - cam_w - 2
     plot_h = out_h // 2
 
     left = draw_left(frame, nlms, hness, cam_w, out_h,
                      macro_task, micro_step, step_idx, total_steps,
                      t0, tc, nl_caption, env, scene, oph,
                      imu_roll, imu_pitch, imu_yaw, step_method)
-    info = draw_info_panel(INFO_W, out_h, rpy_data, grasp_data,
-                           joint_data, imu_accel_history)
+    
+    # Bottom-right panel is now the info panel
     top_r = draw_hand_panel(plot_w, plot_h, cur_hands, rpy_data)
-    bot_r = draw_body_panel(plot_w, plot_h, pose_arr, haw)
+    bot_r = draw_info_panel(plot_w, plot_h, rpy_data, grasp_data,
+                            joint_data, imu_accel_history)
 
     right = np.vstack([top_r, bot_r])
     cv2.line(right,(0,plot_h),(plot_w,plot_h),BORDER,1)
     div = np.full((out_h,1,3),BORDER,np.uint8)
 
-    card = np.hstack([left, div, info, div, right])
+    card = np.hstack([left, div, right])
     card = cv2.resize(card, (out_w, out_h))
     cv2.rectangle(card,(0,0),(card.shape[1]-1,card.shape[0]-1),BORDER,2)
     return card

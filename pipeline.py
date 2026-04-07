@@ -111,6 +111,7 @@ def process_video(
     imu_mag:       bool              = True,
     # Dynamics window
     dyn_window:    int               = 9,
+    limit:         int               = 0,
 ) -> dict:
 
     input_path = Path(input_path)
@@ -209,6 +210,9 @@ def process_video(
             if not ret: break
             pbar.update(1)
 
+            if limit > 0 and fidx >= limit:
+                break
+
             if fidx % skip != 0:
                 fidx += 1
                 continue
@@ -221,8 +225,13 @@ def process_video(
 
             # IMU state at this frame timestamp
             if imu_available:
-                # Try VTS for a more precise timestamp
-                frame_ts = vts.frame_ts(fidx, fps)
+                # VTS frame→ns map aligns with IMU when using shared TRIMU001 v2 origin
+                origin_ns = (
+                    imu_stream.time_origin_ns
+                    if imu_stream.time_origin_ns
+                    else None
+                )
+                frame_ts = vts.frame_ts(fidx, fps, time_origin_ns=origin_ns)
                 imu_state = imu_stream.at(frame_ts)
                 i_roll, i_pitch, i_yaw = imu_state.euler_deg()
                 imu_q = imu_state.quaternion
@@ -231,8 +240,11 @@ def process_video(
                 imu_accel_hist.append(float(np.linalg.norm(cam_accel_world)))
             else:
                 from imu import IMUSample
-                imu_state = IMUSample(ts=tc,
-                    ax=0,ay=0,az=0,gx=0,gy=0,gz=0,mx=0,my=0,mz=0)
+                imu_state = IMUSample(
+                    ts=tc,
+                    ax=0, ay=0, az=0, gx=0, gy=0, gz=0, mx=0, my=0, mz=0,
+                    lin_ax=0, lin_ay=0, lin_az=0,
+                )
                 i_roll = i_pitch = i_yaw = 0.0
                 imu_q = np.array([1.,0.,0.,0.])
                 cam_accel_world = np.zeros(3)
@@ -498,6 +510,7 @@ def main():
     # Dynamics
     ap.add_argument("--dyn_window", type=int, default=9,
                     help="Savitzky-Golay window for velocity smoothing (odd, ≥5)")
+    ap.add_argument("--limit", type=int, default=0, help="Max frames to process (0=all)")
 
     a = ap.parse_args()
 
@@ -523,6 +536,7 @@ def main():
         imu_beta     = a.imu_beta,
         imu_mag      = not a.no_mag,
         dyn_window   = a.dyn_window,
+        limit        = a.limit,
     )
 
     if a.batch:

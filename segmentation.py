@@ -104,9 +104,13 @@ class StepTimeline:
             return
 
         times  = np.array([s.ts for s in samples])
-        energy = np.array([
-            np.sqrt(s.ax**2 + s.ay**2 + s.az**2) for s in samples
-        ])
+        def _accel_mag(s):
+            l2 = s.lin_ax * s.lin_ax + s.lin_ay * s.lin_ay + s.lin_az * s.lin_az
+            if l2 > 1e-12:
+                return float(np.sqrt(l2))
+            return float(np.sqrt(s.ax * s.ax + s.ay * s.ay + s.az * s.az))
+
+        energy = np.array([_accel_mag(s) for s in samples])
 
         # Smooth the energy envelope
         win = min(smooth_win, max(3, len(energy) // 10))

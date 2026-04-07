@@ -152,9 +152,13 @@ class _MadgwickBuiltin:
 @dataclass
 class IMUSample:
     ts:  float
-    ax:  float; ay: float; az: float   # m/s²
+    ax:  float; ay: float; az: float   # m/s² (includes gravity unless from device lin only)
     gx:  float; gy: float; gz: float   # rad/s
     mx:  float; my: float; mz: float   # µT
+    # TRIMU001 v2: gravity-removed body-frame linear acceleration (m/s²); else 0
+    lin_ax: float = 0.0
+    lin_ay: float = 0.0
+    lin_az: float = 0.0
     # filled after fusion:
     quaternion:  np.ndarray = field(default_factory=lambda: np.array([1.,0.,0.,0.]))
     accel_world: np.ndarray = field(default_factory=lambda: np.zeros(3))
@@ -198,6 +202,10 @@ class IMUStream:
         self._fused    = False
         self._ts_arr:  np.ndarray | None = None
         self._q_arr:   np.ndarray | None = None
+        # Nanosecond time of first sample (TRIMU001 v2); 0 if unknown — use with VTS sync
+        self.time_origin_ns: int = 0
+        # From v2 header only (optional)
+        self.video_start_ns: int | None = None
 
         self._load()
 
@@ -207,8 +215,7 @@ class IMUStream:
         raw = self.path.read_bytes()
         # 1. Check for TRI binary signatures
         if raw.startswith(b"TRIMU001"):
-            # TRIMU001: 52-byte header, 80-byte (20-float) records.
-            self.samples = self._parse_tri_imu(raw)
+            self.samples = self._parse_trimu001(raw)
             return
 
         # 2. Try CSV (text)
@@ -221,8 +228,102 @@ class IMUStream:
         # 3. Fallback: try raw binary float64/float32 rows of 10
         self.samples = self._parse_binary(raw)
 
-    def _parse_tri_imu(self, raw: bytes) -> list[IMUSample]:
-        """Parse TRIMU001 20-float records (80 bytes each) starting at offset 52."""
+    def _parse_trimu001(self, raw: bytes) -> list[IMUSample]:
+        """Dispatch TRIMU001 v2 (64-byte header, 76-byte records) vs legacy (52 + 80)."""
+        if len(raw) >= 64:
+            version = struct.unpack_from("<I", raw, 8)[0]
+            v2_ok = (len(raw) - 64) % 76 == 0 and len(raw) > 64
+            legacy_ok = (len(raw) - 52) % 80 == 0 and len(raw) > 52
+            if version == 2 and v2_ok:
+                return self._parse_tri_imu_v2(raw)
+            if v2_ok and not legacy_ok:
+                return self._parse_tri_imu_v2(raw)
+            if legacy_ok and version != 2:
+                return self._parse_tri_imu_legacy(raw)
+            if legacy_ok and not v2_ok:
+                return self._parse_tri_imu_legacy(raw)
+            if v2_ok:
+                return self._parse_tri_imu_v2(raw)
+        if len(raw) > 52 and (len(raw) - 52) % 80 == 0:
+            return self._parse_tri_imu_legacy(raw)
+        if len(raw) >= 64 and (len(raw) - 64) % 76 == 0:
+            return self._parse_tri_imu_v2(raw)
+        raise ValueError(
+            f"TRIMU001 file size {len(raw)} does not match v2 (64+76n) or legacy (52+80n)"
+        )
+
+    def _parse_tri_imu_v2(self, raw: bytes) -> list[IMUSample]:
+        """
+        TRIMU001 format version 2: 64-byte header, 76-byte little-endian samples.
+        Quaternion on disk is XYZW (SciPy); IMUSample stores WXYZ.
+        """
+        header = raw[:64]
+        (
+            magic,
+            version,
+            sample_rate_hz,
+            _accel_fs,
+            _gyro_fs,
+            start_time_ns,
+            video_start_ns,
+        ) = struct.unpack("<8s I I 2B 6x Q Q 24x", header)
+        if not magic.startswith(b"TRIMU001"):
+            raise ValueError("Invalid TRIMU001 v2 magic")
+        self.video_start_ns = int(video_start_ns)
+        _ = version, sample_rate_hz, start_time_ns  # available for diagnostics
+
+        record_size = 76
+        data = raw[64:]
+        n = len(data) // record_size
+        if n == 0:
+            self.time_origin_ns = 0
+            return []
+
+        samples: list[IMUSample] = []
+        anchor_ns: int | None = None
+        for i in range(n):
+            chunk = data[i * record_size : (i + 1) * record_size]
+            unpacked = struct.unpack("<Q 3f 3f 3f f 4f 3f", chunk)
+            ts_ns = int(unpacked[0])
+            if anchor_ns is None:
+                anchor_ns = ts_ns
+            accel = unpacked[1:4]
+            gyro = unpacked[4:7]
+            mag = unpacked[7:10]
+            qx, qy, qz, qw = unpacked[11:15]
+            lin = unpacked[15:18]
+            q_xyzw = np.array([qx, qy, qz, qw], dtype=np.float64)
+            nq = float(np.linalg.norm(q_xyzw))
+            if 0.9 < nq < 1.1:
+                q_xyzw = q_xyzw / nq
+                qw_n, qx_n, qy_n, qz_n = float(q_xyzw[3]), float(q_xyzw[0]), float(q_xyzw[1]), float(q_xyzw[2])
+                quat_wxyz = np.array([qw_n, qx_n, qy_n, qz_n])
+            else:
+                quat_wxyz = np.array([1.0, 0.0, 0.0, 0.0])
+
+            samples.append(
+                IMUSample(
+                    ts=(ts_ns - anchor_ns) * 1e-9,
+                    ax=float(accel[0]),
+                    ay=float(accel[1]),
+                    az=float(accel[2]),
+                    gx=float(gyro[0]),
+                    gy=float(gyro[1]),
+                    gz=float(gyro[2]),
+                    mx=float(mag[0]),
+                    my=float(mag[1]),
+                    mz=float(mag[2]),
+                    lin_ax=float(lin[0]),
+                    lin_ay=float(lin[1]),
+                    lin_az=float(lin[2]),
+                    quaternion=quat_wxyz,
+                )
+            )
+        self.time_origin_ns = int(anchor_ns) if anchor_ns is not None else 0
+        return samples
+
+    def _parse_tri_imu_legacy(self, raw: bytes) -> list[IMUSample]:
+        """Parse TRIMU001 legacy: 52-byte header, 80-byte (20-float) records."""
         header_size = 52
         record_size = 80
         data = raw[header_size:]
@@ -406,10 +507,14 @@ class IMUStream:
                     else:
                         s.quaternion = filt._update_imu(gyr, acc).copy()
 
-            # Gravity-subtracted acceleration in world frame
+            # World-frame acceleration: device linear (gravity already removed) vs derived
             R = s.rotation_matrix()
-            acc_world = R @ acc
-            s.accel_world = acc_world - g_world   # remove gravity
+            lin = np.array([s.lin_ax, s.lin_ay, s.lin_az])
+            if float(np.linalg.norm(lin)) > 1e-9:
+                s.accel_world = R @ lin
+            else:
+                acc_world = R @ acc
+                s.accel_world = acc_world - g_world
 
         self._fused = True
 
@@ -459,6 +564,9 @@ class IMUStream:
             ax = lerp(s0.ax, s1.ax), ay = lerp(s0.ay, s1.ay), az = lerp(s0.az, s1.az),
             gx = lerp(s0.gx, s1.gx), gy = lerp(s0.gy, s1.gy), gz = lerp(s0.gz, s1.gz),
             mx = lerp(s0.mx, s1.mx), my = lerp(s0.my, s1.my), mz = lerp(s0.mz, s1.mz),
+            lin_ax = lerp(s0.lin_ax, s1.lin_ax),
+            lin_ay = lerp(s0.lin_ay, s1.lin_ay),
+            lin_az = lerp(s0.lin_az, s1.lin_az),
             quaternion  = q_interp,
             accel_world = lerp(s0.accel_world, s1.accel_world),
         )

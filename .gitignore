@@ -12,3 +12,17 @@ hand_landmarker.task
 output.csv
 output.jsonl
 pose_landmarker_lite.task
+*.tar
+*.imu
+*.vts
+*.mp4
+*.csv
+*.jsonl
+*.json
+*.txt
+*.log
+*.log.gz
+*.log.tar.gz
+*.log.tar.gz.part
+*.log.tar.gz.part.1
+factory*/

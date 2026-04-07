@@ -18,10 +18,11 @@ Usage:
     vts = VTSParser("recording.vts")
     print(vts)               # shows detected format + row count
     ts = vts.timestamps      # array of timestamps
-    t_frame = vts.frame_ts(30, fps=30.0)   # timestamp of frame 30
+    t_frame = vts.frame_ts(30, fps=30.0, time_origin_ns=imu_stream.time_origin_ns)
 """
 
 from __future__ import annotations
+import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -36,15 +37,46 @@ class VTSData:
     raw:        np.ndarray | None = None            # full raw array
     meta:       dict = field(default_factory=dict)
 
-    def frame_ts(self, frame_idx: int, fps: float) -> float:
+    def timestamp_ns_for_frame(self, frame_idx: int) -> int | None:
+        """Absolute nanosecond timestamp for a video frame index, if known."""
+        m = self.meta.get("frame_ts_ns")
+        if isinstance(m, dict):
+            return m.get(int(frame_idx))
+        return None
+
+    def frame_ts(
+        self,
+        frame_idx: int,
+        fps: float,
+        time_origin_ns: int | None = None,
+    ) -> float:
         """
-        Estimate the IMU/VTS timestamp corresponding to video frame `frame_idx`.
-        If the .vts file contains a timestamp array, use direct lookup;
-        otherwise fall back to frame_idx / fps.
+        Timestamp in seconds aligned with IMUStream when `time_origin_ns` is the
+        first IMU sample's `timestamp_ns` (TRIMU001 v2). Otherwise seconds since
+        first VTS entry (legacy) or `frame_idx / fps`.
         """
-        if len(self.timestamps) > frame_idx:
-            return float(self.timestamps[frame_idx])
-        return frame_idx / fps
+        fi = int(frame_idx)
+        ft = self.meta.get("frame_ts_ns")
+        if isinstance(ft, dict):
+            ns = ft.get(fi)
+            if ns is not None:
+                if time_origin_ns is not None:
+                    return (int(ns) - int(time_origin_ns)) * 1e-9
+                anchor = int(self.meta.get("vts_time_anchor_ns", 0))
+                return (int(ns) - anchor) * 1e-9
+
+        ts_pi = self.meta.get("ts_ns_per_index")
+        if isinstance(ts_pi, np.ndarray) and fi < len(ts_pi):
+            ns = int(ts_pi[fi])
+            if time_origin_ns is not None:
+                return (ns - int(time_origin_ns)) * 1e-9
+            if len(self.timestamps) > fi:
+                return float(self.timestamps[fi])
+            return (ns - int(ts_pi[0])) * 1e-9
+
+        if len(self.timestamps) > fi:
+            return float(self.timestamps[fi])
+        return fi / fps
 
     def __repr__(self) -> str:
         p = f", poses={self.poses.shape}" if self.poses is not None else ""
@@ -75,8 +107,16 @@ class VTSParser:
     def poses(self) -> np.ndarray | None:
         return self.data.poses
 
-    def frame_ts(self, frame_idx: int, fps: float) -> float:
-        return self.data.frame_ts(frame_idx, fps)
+    def frame_ts(
+        self,
+        frame_idx: int,
+        fps: float,
+        time_origin_ns: int | None = None,
+    ) -> float:
+        return self.data.frame_ts(frame_idx, fps, time_origin_ns=time_origin_ns)
+
+    def timestamp_ns_for_frame(self, frame_idx: int) -> int | None:
+        return self.data.timestamp_ns_for_frame(frame_idx)
 
     def __repr__(self) -> str:
         return repr(self.data)
@@ -114,20 +154,74 @@ class VTSParser:
         )
 
     def _parse_tri_vts(self, raw: bytes) -> VTSData:
-        """Parse TRIVTS01: 32-byte header, then uint64 nanoseconds."""
+        """TRIVTS: 32-byte header, then either (uint32 frame, uint64 ts_ns) × N or uint64 ts_ns × N."""
         header_size = 32
         data = raw[header_size:]
+        if len(data) == 0:
+            return VTSData(format="tri_vts_empty", timestamps=np.array([]))
+
+        n12 = len(data) // 12
+        if n12 > 0 and len(data) % 12 == 0:
+            parsed = self._try_tri_vts_frame_map(data, n12)
+            if parsed is not None:
+                return parsed
+
         n = len(data) // 8
         if n == 0:
             return VTSData(format="tri_vts_empty", timestamps=np.array([]))
-            
-        ts_ns = np.frombuffer(data[:n*8], dtype=np.uint64).astype(np.float64)
-        ts_sec = (ts_ns - ts_ns[0]) / 1e9
-        
+
+        ts_ns = np.frombuffer(data[: n * 8], dtype=np.uint64)
+        ts_sec = (ts_ns.astype(np.float64) - float(ts_ns[0])) / 1e9
+
         return VTSData(
             format="tri_vts_u64",
             timestamps=ts_sec,
-            meta={"n": n}
+            meta={"n": n, "ts_ns_per_index": ts_ns.copy()},
+        )
+
+    def _try_tri_vts_frame_map(self, data: bytes, n12: int) -> VTSData | None:
+        """12-byte records: frame (u32), timestamp_ns (u64). Returns None if implausible."""
+        frames: list[int] = []
+        ts_list: list[int] = []
+        for i in range(n12):
+            chunk = data[i * 12 : (i + 1) * 12]
+            frame_u32, ts_ns = struct.unpack("<IQ", chunk)
+            frames.append(int(frame_u32))
+            ts_list.append(int(ts_ns))
+
+        if not frames:
+            return None
+
+        ts_arr = np.array(ts_list, dtype=np.int64)
+        # Distinguish from uint64-only streams when len is multiple of 24:
+        # frame indices stay modest; timestamps do not look like two stacked u64s.
+        if np.any(np.diff(ts_arr) < 0) or np.any(ts_arr < 0):
+            return None
+        if max(frames) > 50_000_000 or min(frames) < 0:
+            return None
+        # If "frames" are huge, this was probably raw u64 data reinterpreted.
+        if max(frames) > n12 + 1_000_000:
+            return None
+
+        frame_ts_ns: dict[int, int] = {}
+        for f, t in zip(frames, ts_list):
+            frame_ts_ns[f] = t
+
+        min_ts = int(np.min(ts_arr))
+        max_f = max(frames)
+        ts_by_index = np.zeros(max_f + 1, dtype=np.float64)
+        for f, t in frame_ts_ns.items():
+            if 0 <= f <= max_f:
+                ts_by_index[f] = (t - min_ts) * 1e-9
+
+        return VTSData(
+            format="tri_vts_frame_u32_ts_u64",
+            timestamps=ts_by_index,
+            meta={
+                "n": n12,
+                "frame_ts_ns": frame_ts_ns,
+                "vts_time_anchor_ns": min_ts,
+            },
         )
 
     # ── Format probes ─────────────────────────────────────────────────────────
